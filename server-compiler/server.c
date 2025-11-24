@@ -13,7 +13,7 @@
 
 #define BUFFER_SIZE 4096
 #define MAX_OUTPUT_SIZE 4000
-#define TEMP_FILE_TEMPLATE "/tmp/go_exec.go"
+#define TEMP_FILE_TEMPLATE "./go_exec_XXXXXX.go"
 
 
 // --- Funções Auxiliares de String e Erro ---
