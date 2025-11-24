@@ -1,179 +1,194 @@
 import json
 import os
+import re
 import subprocess
-import sys
-import time
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext
 
 # --- Configurações ---
-# Nome do arquivo de código Go que será editado e enviado
-CODE_FILE = "main.go"
-# Nome do arquivo temporário que será enviado ao servidor (Cliente C lerá este arquivo)
+# Nome do arquivo inicial que será carregado/editado
+INITIAL_CODE_FILE = "main.go"
+# Nome do arquivo temporário que será enviado ao servidor via cliente C
 TEMP_SEND_FILE = "code_to_send.go"
 # Caminho para o executável do cliente C
 CLIENT_EXECUTABLE = "./client"
-# O comando do editor de texto que será usado (pode ser 'nano', 'vim', 'code', 'open -t', etc.)
-# Recomendado usar um editor CLI básico como 'nano' ou 'vim' para melhor portabilidade no terminal.
-# Se estiver no macOS, 'open -t' tentará abrir no TextEdit. No Linux, 'nano' é comum.
-EDITOR_COMMAND = "nano"
-# Porta do servidor C
-SERVER_PORT = 8400
 
 
-def load_initial_code(filename: str) -> str:
-    """Carrega o código Go inicial, criando o arquivo se não existir."""
-    try:
-        with open(filename, "r") as f:
-            return f.read()
-    except FileNotFoundError:
-        print(f"Arquivo '{filename}' não encontrado. Criando um modelo...")
-        initial_content = 'package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println("Hello do CLI!")\n}'
+class RemoteExecutorApp:
+    def __init__(self, master):
+        self.master = master
+        master.title("Executor de Código Go Remoto (Cliente C)")
+
+        # Variável para armazenar o código de teste
+        self.code_content = self.load_initial_code()
+
+        # --- Configuração da Interface ---
+        self.setup_ui()
+
+    def setup_ui(self):
+        # 1. Área de Edição de Código
+        code_frame = tk.LabelFrame(
+            self.master,
+            text=f"Código Go ({INITIAL_CODE_FILE} - Clique em Salvar antes de Enviar)",
+            padx=10,
+            pady=10,
+        )
+        code_frame.pack(padx=10, pady=5, fill="both", expand=True)
+
+        self.code_text = scrolledtext.ScrolledText(
+            code_frame, wrap=tk.WORD, width=80, height=20, font=("Consolas", 12)
+        )
+        self.code_text.insert(tk.INSERT, self.code_content)
+        self.code_text.pack(fill="both", expand=True)
+
+        # 2. Botões de Ação
+        button_frame = tk.Frame(self.master)
+        button_frame.pack(pady=5)
+
+        self.save_button = tk.Button(
+            button_frame, text="1. Salvar Código", command=self.save_code, bg="#ADD8E6"
+        )
+        self.save_button.pack(side=tk.LEFT, padx=10)
+
+        self.send_button = tk.Button(
+            button_frame,
+            text="2. Enviar e Executar (via Client C)",
+            command=self.send_code,
+            bg="#90EE90",
+        )
+        self.send_button.pack(side=tk.LEFT, padx=10)
+
+        # 3. Área de Resultado
+        result_frame = tk.LabelFrame(
+            self.master, text="Resultado e Erros do Servidor", padx=10, pady=5
+        )
+        result_frame.pack(padx=10, pady=5, fill="x")
+
+        self.result_text = scrolledtext.ScrolledText(
+            result_frame,
+            wrap=tk.WORD,
+            width=80,
+            height=10,
+            font=("Consolas", 10),
+            state=tk.DISABLED,
+            bg="#F0F0F0",
+        )
+        self.result_text.pack(fill="x")
+
+    def load_initial_code(self):
+        """Carrega o código Go inicial do arquivo."""
         try:
-            with open(filename, "w") as f:
-                f.write(initial_content)
-            return initial_content
-        except Exception as e:
-            print(f"Erro ao criar o arquivo: {e}")
-            sys.exit(1)
+            with open(INITIAL_CODE_FILE, "r") as f:
+                return f.read()
+        except FileNotFoundError:
+            return 'package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println("Crie seu código aqui!")\n}'
 
-
-def run_editor(filename: str):
-    """Abre o arquivo no editor de texto padrão."""
-    try:
-        print(
-            f"\nAbrindo '{filename}' no editor ({EDITOR_COMMAND})... Salve e feche o editor para continuar."
-        )
-        # O subprocesso bloqueia até que o editor seja fechado
-        subprocess.run([EDITOR_COMMAND, filename], check=True)
-        print(f"Código salvo e editor fechado.")
-        return True
-    except FileNotFoundError:
-        print(
-            f"ERRO: Comando do editor '{EDITOR_COMMAND}' não encontrado. Tente 'vim' ou 'nano'."
-        )
-        return False
-    except subprocess.CalledProcessError as e:
-        print(f"ERRO: O editor retornou um erro: {e}")
-        return False
-
-
-def send_code():
-    """Executa o cliente C para enviar o código."""
-
-    # 1. Copia o código principal para o arquivo que o cliente C irá ler
-    try:
-        current_code = ""
-        with open(CODE_FILE, "r") as f_main:
-            current_code = f_main.read()
-
-        with open(TEMP_SEND_FILE, "w") as f_temp:
-            f_temp.write(current_code)
-
-    except Exception as e:
-        print(f"ERRO: Falha ao copiar/salvar o arquivo de envio: {e}")
-        return
-
-    print(f"\n--- Enviando código para o servidor C em {SERVER_PORT} ---")
-
-    try:
-        # Executa o cliente C, passando o nome do arquivo temporário como argumento
-        result = subprocess.run(
-            [CLIENT_EXECUTABLE, TEMP_SEND_FILE],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=30,
-        )
-
-        # O cliente C imprime a resposta JSON na saída padrão (stdout)
-        raw_output = result.stdout
-
-        # 2. Processar a string JSON retornada pelo cliente C
-        start = raw_output.find("{")
-        end = raw_output.rfind("}")
-
-        if start == -1 or end == -1:
-            print(
-                f"ERRO: Cliente C não retornou JSON válido.\nOutput Bruto:\n{raw_output}"
+    def save_code(self):
+        """Salva o conteúdo atual do editor para o arquivo temporário de envio."""
+        current_code = self.code_text.get("1.0", tk.END)
+        try:
+            with open(TEMP_SEND_FILE, "w") as f:
+                f.write(current_code)
+            messagebox.showinfo(
+                "Sucesso", f"Código salvo com sucesso em '{TEMP_SEND_FILE}'."
             )
+            return True
+        except Exception as e:
+            messagebox.showerror("Erro de Arquivo", f"Falha ao salvar o código: {e}")
+            return False
+
+    def display_result(self, content, is_error=False):
+        """Exibe o resultado na área de texto."""
+        self.result_text.config(state=tk.NORMAL)
+        self.result_text.delete("1.0", tk.END)
+
+        tag = "error" if is_error else "output"
+        color = "red" if is_error else "green"
+
+        self.result_text.tag_config(tag, foreground=color)
+        self.result_text.insert(tk.END, content, tag)
+        self.result_text.config(state=tk.DISABLED)
+
+    def send_code(self):
+        """Executa o cliente C para enviar o código."""
+        if not self.save_code():
             return
 
-        json_response = raw_output[start : end + 1]
-        response = json.loads(json_response)
+        self.display_result("Enviando código para o servidor C executor...")
 
-        # Substitui os escapes do JSON por quebras de linha reais para melhor visualização
-        output = response.get("output", "").replace("\\n", "\n").replace('\\"', '"')
-        error_msg = response.get("error", "").replace("\\n", "\n").replace('\\"', '"')
+        try:
+            # Executa o cliente C, passando o nome do arquivo temporário como argumento
+            # o cliente C lê o arquivo, faz o JSON, envia e recebe a resposta JSON
+            result = subprocess.run(
+                [CLIENT_EXECUTABLE, TEMP_SEND_FILE],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,  # Timeout para a execução remota
+            )
 
-        # 3. Exibir o resultado final
-        print("\n" + "=" * 50)
-        print("✅ RESULTADO DA EXECUÇÃO REMOTA")
-        print("=" * 50)
+            # O cliente C imprime a resposta JSON na saída padrão (stdout)
+            raw_output = result.stdout
 
-        if error_msg:
-            print("🔴 ERRO DE COMPILAÇÃO/EXECUÇÃO NO SERVIDOR:")
-            print("-" * 40)
-            print(error_msg)
-            print("-" * 40)
-        else:
-            print("🟢 SAÍDA PADRÃO (STDOUT):")
-            print("-" * 40)
-            print(output)
-            print("-" * 40)
+            # 1. Extrair a string JSON da saída bruta (pode ter logs do cliente C)
+            # Procuramos pela primeira e última chave {} para isolar o JSON
+            start = raw_output.find("{")
+            end = raw_output.rfind("}")
 
-    except subprocess.CalledProcessError as e:
-        print(f"ERRO FATAL NO CLIENTE C: Falha na conexão ou execução.\n{e.stderr}")
-    except FileNotFoundError:
-        print(
-            f"ERRO: O executável do cliente C não foi encontrado em '{CLIENT_EXECUTABLE}'."
-        )
-    except json.JSONDecodeError:
-        print(
-            f"ERRO: Resposta inválida (JSON corrompido) recebida do servidor/cliente.\nResposta:\n{json_response}"
-        )
-    except Exception as e:
-        print(f"Erro inesperado durante a execução: {e}")
+            if start == -1 or end == -1:
+                self.display_result(
+                    f"ERRO: Cliente C não retornou JSON válido.\nOutput do Cliente:\n{raw_output}",
+                    True,
+                )
+                return
 
+            json_response = raw_output[start : end + 1]
 
-def main_menu():
-    """Loop principal da interface CLI."""
+            # 2. Processar o JSON (Converter escapes de volta)
+            response = json.loads(json_response)
 
-    # Garante que o arquivo principal exista antes de começar
-    load_initial_code(CODE_FILE)
+            # Substitui os escapes do JSON por quebras de linha reais para melhor visualização
+            output = response.get("output", "").replace("\\n", "\n").replace('\\"', '"')
+            error_msg = (
+                response.get("error", "").replace("\\n", "\n").replace('\\"', '"')
+            )
 
-    while True:
-        print("\n" + "=" * 50)
-        print(f"⚙️ EXECUTOR REMOTO GO (CLI) | Arquivo: {CODE_FILE}")
-        print("=" * 50)
-        print("1. [E]ditar Código (Abre o editor)")
-        print("2. [S]end/Executar")
-        print("3. [V]er Código Atual")
-        print("4. [Q]uit/Sair")
-        print("-" * 50)
+            # 3. Exibir o resultado final
+            if error_msg:
+                self.display_result(error_msg, is_error=True)
+            else:
+                self.display_result(output)
 
-        choice = input("Escolha a opção (1-4): ").strip().lower()
-
-        if choice in ("1", "e", "editar"):
-            run_editor(CODE_FILE)
-
-        elif choice in ("2", "s", "send", "executar"):
-            send_code()
-
-        elif choice in ("3", "v", "ver"):
-            print("\n" + "~" * 20 + f" CÓDIGO ATUAL EM {CODE_FILE} " + "~" * 20)
-            try:
-                with open(CODE_FILE, "r") as f:
-                    print(f.read())
-            except:
-                print("Não foi possível ler o arquivo.")
-            print("~" * (40 + len(CODE_FILE) + 10))
-
-        elif choice in ("4", "q", "quit", "sair"):
-            print("Saindo do executor. Adeus!")
-            break
-
-        else:
-            print("Opção inválida. Tente novamente.")
+        except subprocess.CalledProcessError as e:
+            # Erro na execução do cliente C (ex: falha ao conectar)
+            self.display_result(
+                f"ERRO DE EXECUÇÃO DO CLIENTE C:\nCódigo de Retorno: {e.returncode}\nSaída de Erro:\n{e.stderr}",
+                True,
+            )
+        except FileNotFoundError:
+            self.display_result(
+                f"ERRO: O executável do cliente C não foi encontrado em '{CLIENT_EXECUTABLE}'.",
+                True,
+            )
+        except json.JSONDecodeError:
+            self.display_result(
+                f"ERRO: O servidor retornou uma string JSON inválida.\nResposta:\n{json_response}",
+                True,
+            )
+        except Exception as e:
+            self.display_result(f"Erro inesperado: {e}", True)
 
 
+# --- Inicialização da Aplicação ---
 if __name__ == "__main__":
-    main_menu()
+    # Certifique-se de que o arquivo Go inicial exista para evitar erro ao carregar
+    if not os.path.exists(INITIAL_CODE_FILE):
+        print(f"ATENÇÃO: Criando o arquivo inicial '{INITIAL_CODE_FILE}'.")
+        with open(INITIAL_CODE_FILE, "w") as f:
+            f.write(
+                'package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println("Hello do GUI!")\n}'
+            )
+
+    root = tk.Tk()
+    app = RemoteExecutorApp(root)
+    root.mainloop()
