@@ -1,194 +1,258 @@
 import json
 import os
-import re
-import subprocess
-import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
+import socket
+import sys
 
-# --- Configurações ---
-# Nome do arquivo inicial que será carregado/editado
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtWidgets import (
+    QApplication,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QPushButton,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+# --- Configurações de Comunicação ---
+HOST = "127.0.0.1"
+PORT = 8300  # Porta do Servidor C Executor
 INITIAL_CODE_FILE = "main.go"
-# Nome do arquivo temporário que será enviado ao servidor via cliente C
-TEMP_SEND_FILE = "code_to_send.go"
-# Caminho para o executável do cliente C
-CLIENT_EXECUTABLE = "./client"
+
+# ----------------------------------------------------------------------
+# --- Thread de Comunicação TCP (Worker) ---
+# A lógica TCP é mantida, garantindo que a GUI não congele.
+# ----------------------------------------------------------------------
 
 
-class RemoteExecutorApp:
-    def __init__(self, master):
-        self.master = master
-        master.title("Executor de Código Go Remoto (Cliente C)")
+class TcpWorker(QThread):
+    result_signal = pyqtSignal(dict)
+    error_signal = pyqtSignal(str)
 
-        # Variável para armazenar o código de teste
-        self.code_content = self.load_initial_code()
+    def __init__(self, code_content: str):
+        super().__init__()
+        self.code_content = code_content
 
-        # --- Configuração da Interface ---
-        self.setup_ui()
+    def run(self):
+        """Executa a lógica de comunicação TCP (simulando o client.c)."""
 
-    def setup_ui(self):
-        # 1. Área de Edição de Código
-        code_frame = tk.LabelFrame(
-            self.master,
-            text=f"Código Go ({INITIAL_CODE_FILE} - Clique em Salvar antes de Enviar)",
-            padx=10,
-            pady=10,
-        )
-        code_frame.pack(padx=10, pady=5, fill="both", expand=True)
+        response_data = {}
 
-        self.code_text = scrolledtext.ScrolledText(
-            code_frame, wrap=tk.WORD, width=80, height=20, font=("Consolas", 12)
-        )
-        self.code_text.insert(tk.INSERT, self.code_content)
-        self.code_text.pack(fill="both", expand=True)
-
-        # 2. Botões de Ação
-        button_frame = tk.Frame(self.master)
-        button_frame.pack(pady=5)
-
-        self.save_button = tk.Button(
-            button_frame, text="1. Salvar Código", command=self.save_code, bg="#ADD8E6"
-        )
-        self.save_button.pack(side=tk.LEFT, padx=10)
-
-        self.send_button = tk.Button(
-            button_frame,
-            text="2. Enviar e Executar (via Client C)",
-            command=self.send_code,
-            bg="#90EE90",
-        )
-        self.send_button.pack(side=tk.LEFT, padx=10)
-
-        # 3. Área de Resultado
-        result_frame = tk.LabelFrame(
-            self.master, text="Resultado e Erros do Servidor", padx=10, pady=5
-        )
-        result_frame.pack(padx=10, pady=5, fill="x")
-
-        self.result_text = scrolledtext.ScrolledText(
-            result_frame,
-            wrap=tk.WORD,
-            width=80,
-            height=10,
-            font=("Consolas", 10),
-            state=tk.DISABLED,
-            bg="#F0F0F0",
-        )
-        self.result_text.pack(fill="x")
-
-    def load_initial_code(self):
-        """Carrega o código Go inicial do arquivo."""
         try:
-            with open(INITIAL_CODE_FILE, "r") as f:
-                return f.read()
-        except FileNotFoundError:
-            return 'package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println("Crie seu código aqui!")\n}'
-
-    def save_code(self):
-        """Salva o conteúdo atual do editor para o arquivo temporário de envio."""
-        current_code = self.code_text.get("1.0", tk.END)
-        try:
-            with open(TEMP_SEND_FILE, "w") as f:
-                f.write(current_code)
-            messagebox.showinfo(
-                "Sucesso", f"Código salvo com sucesso em '{TEMP_SEND_FILE}'."
+            # 1. Escapar e montar a payload JSON
+            # Garante que backslashes, novas linhas e aspas sejam escapados.
+            escaped_code = (
+                self.code_content.replace("\\", "\\\\")
+                .replace("\n", "\\n")
+                .replace('"', '\\"')
             )
-            return True
+
+            tcp_payload = f'{{"code":"{escaped_code}"}}\n'
+
+            # 2. Criar e Conectar o Socket
+            with socket.create_connection((HOST, PORT), timeout=10) as conn:
+                conn.sendall(tcp_payload.encode("utf-8"))
+
+                # 3. Receber a Resposta
+                response_bytes = conn.recv(4096)
+
+                if not response_bytes:
+                    self.error_signal.emit(
+                        "Servidor C fechou a conexão ou não enviou resposta."
+                    )
+                    return
+
+                response_json = response_bytes.decode("utf-8").strip()
+
+                # 4. Decodificar a resposta do C Server
+                response_data = json.loads(response_json)
+
+        except socket.timeout:
+            self.error_signal.emit(
+                "ERRO: Tempo limite (timeout) atingido ao conectar ou ler do servidor."
+            )
+            return
+        except ConnectionRefusedError:
+            self.error_signal.emit(
+                f"ERRO: Conexão recusada em {HOST}:{PORT}. O Servidor C está rodando?"
+            )
+            return
+        except json.JSONDecodeError:
+            self.error_signal.emit(
+                f"ERRO: Resposta inválida (JSON corrompido) recebida: {response_json}"
+            )
+            return
         except Exception as e:
-            messagebox.showerror("Erro de Arquivo", f"Falha ao salvar o código: {e}")
-            return False
-
-    def display_result(self, content, is_error=False):
-        """Exibe o resultado na área de texto."""
-        self.result_text.config(state=tk.NORMAL)
-        self.result_text.delete("1.0", tk.END)
-
-        tag = "error" if is_error else "output"
-        color = "red" if is_error else "green"
-
-        self.result_text.tag_config(tag, foreground=color)
-        self.result_text.insert(tk.END, content, tag)
-        self.result_text.config(state=tk.DISABLED)
-
-    def send_code(self):
-        """Executa o cliente C para enviar o código."""
-        if not self.save_code():
+            self.error_signal.emit(f"ERRO inesperado na comunicação TCP: {str(e)}")
             return
 
-        self.display_result("Enviando código para o servidor C executor...")
+        self.result_signal.emit(response_data)
 
+
+# ----------------------------------------------------------------------
+# --- Aplicação Principal PyQt6 ---
+# ----------------------------------------------------------------------
+
+
+class ExecutorGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Executor de Código Go Remoto (PyQt6)")
+        self.setGeometry(100, 100, 1000, 800)
+
+        self.worker = None
+        self.load_initial_code()
+        self.init_ui()
+
+    def load_initial_code(self):
+        """Carrega o código Go inicial, criando o arquivo se não existir."""
         try:
-            # Executa o cliente C, passando o nome do arquivo temporário como argumento
-            # o cliente C lê o arquivo, faz o JSON, envia e recebe a resposta JSON
-            result = subprocess.run(
-                [CLIENT_EXECUTABLE, TEMP_SEND_FILE],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=30,  # Timeout para a execução remota
-            )
-
-            # O cliente C imprime a resposta JSON na saída padrão (stdout)
-            raw_output = result.stdout
-
-            # 1. Extrair a string JSON da saída bruta (pode ter logs do cliente C)
-            # Procuramos pela primeira e última chave {} para isolar o JSON
-            start = raw_output.find("{")
-            end = raw_output.rfind("}")
-
-            if start == -1 or end == -1:
-                self.display_result(
-                    f"ERRO: Cliente C não retornou JSON válido.\nOutput do Cliente:\n{raw_output}",
-                    True,
-                )
-                return
-
-            json_response = raw_output[start : end + 1]
-
-            # 2. Processar o JSON (Converter escapes de volta)
-            response = json.loads(json_response)
-
-            # Substitui os escapes do JSON por quebras de linha reais para melhor visualização
-            output = response.get("output", "").replace("\\n", "\n").replace('\\"', '"')
-            error_msg = (
-                response.get("error", "").replace("\\n", "\n").replace('\\"', '"')
-            )
-
-            # 3. Exibir o resultado final
-            if error_msg:
-                self.display_result(error_msg, is_error=True)
-            else:
-                self.display_result(output)
-
-        except subprocess.CalledProcessError as e:
-            # Erro na execução do cliente C (ex: falha ao conectar)
-            self.display_result(
-                f"ERRO DE EXECUÇÃO DO CLIENTE C:\nCódigo de Retorno: {e.returncode}\nSaída de Erro:\n{e.stderr}",
-                True,
-            )
+            with open(INITIAL_CODE_FILE, "r") as f:
+                self.initial_code = f.read()
         except FileNotFoundError:
-            self.display_result(
-                f"ERRO: O executável do cliente C não foi encontrado em '{CLIENT_EXECUTABLE}'.",
-                True,
+            self.initial_code = 'package main\n\nimport "fmt"\n\nfunc main() {\n\t// Edite seu código aqui\n\tfmt.Println("Execução bem-sucedida!")\n}'
+
+    def init_ui(self):
+        central_widget = QWidget()
+        main_layout = QVBoxLayout(central_widget)
+
+        # 1. --- Área de Edição e Botão (Agrupado) ---
+        editor_group = QGroupBox("Código Fonte Go")
+        editor_layout = QVBoxLayout(editor_group)
+
+        self.code_editor = QTextEdit()
+        self.code_editor.setFont(QFont("Consolas", 12))
+        self.code_editor.setText(self.initial_code)
+
+        # Estilo para o editor de código
+        self.code_editor.setStyleSheet(
+            "background-color: #2e2e2e; color: #ffffff; border: 1px solid #555555;"
+        )
+
+        editor_layout.addWidget(self.code_editor)
+
+        self.send_button = QPushButton("Enviar e Executar")
+        self.send_button.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        self.send_button.setStyleSheet(
+            "background-color: #007bff; color: white; padding: 10px; border-radius: 5px;"
+        )
+        self.send_button.clicked.connect(self.start_execution)
+        editor_layout.addWidget(self.send_button)
+
+        main_layout.addWidget(editor_group, 2)  # Fator de alongamento 2
+
+        # 2. --- Área de Saída (Divisão Horizontal) ---
+        output_group = QGroupBox("Resultados da Execução no Servidor")
+        output_layout = QHBoxLayout(output_group)
+
+        # 2.1. Caixa de Saída Padrão (Stdout)
+        stdout_box = QGroupBox("Saída Padrão (Stdout)")
+        stdout_layout = QVBoxLayout(stdout_box)
+
+        self.stdout_output = QTextEdit()
+        self.stdout_output.setReadOnly(True)
+        self.stdout_output.setFont(QFont("Consolas", 10))
+        self.stdout_output.setStyleSheet(
+            "background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb;"
+        )
+        self.stdout_output.setText("Aguardando execução...")
+
+        stdout_layout.addWidget(self.stdout_output)
+        output_layout.addWidget(stdout_box, 1)  # Fator de alongamento 1
+
+        # 2.2. Caixa de Erro (Stderr)
+        error_box = QGroupBox("Erro de Compilação/Execução (Stderr)")
+        error_layout = QVBoxLayout(error_box)
+
+        self.error_output = QTextEdit()
+        self.error_output.setReadOnly(True)
+        self.error_output.setFont(QFont("Consolas", 10))
+        self.error_output.setStyleSheet(
+            "background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb;"
+        )
+
+        error_layout.addWidget(self.error_output)
+        output_layout.addWidget(error_box, 1)  # Fator de alongamento 1
+
+        main_layout.addWidget(output_group, 1)  # Fator de alongamento 1
+
+        self.setCentralWidget(central_widget)
+
+    def reset_output_boxes(self):
+        """Limpa as caixas de saída e define o estilo padrão."""
+        self.stdout_output.setText("")
+        self.error_output.setText("")
+        # Restaura os estilos padrão
+        self.stdout_output.setStyleSheet(
+            "background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb;"
+        )
+        self.error_output.setStyleSheet(
+            "background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb;"
+        )
+
+    def start_execution(self):
+        """Inicia a thread worker para executar o código."""
+        self.send_button.setEnabled(False)
+        self.reset_output_boxes()
+        self.error_output.setText("Conectando e enviando código... Por favor, aguarde.")
+        self.error_output.setStyleSheet(
+            "background-color: #ffffcc; color: black; border: 1px solid #cccc00;"
+        )
+
+        code = self.code_editor.toPlainText()
+
+        self.worker = TcpWorker(code)
+        self.worker.result_signal.connect(self.handle_result)
+        self.worker.error_signal.connect(self.handle_error)
+        self.worker.start()
+
+    def handle_result(self, result_dict: dict):
+        """Recebe o resultado de sucesso da thread e atualiza a GUI."""
+        self.send_button.setEnabled(True)
+        self.reset_output_boxes()
+
+        # Desescapa os caracteres de nova linha e aspas
+        output = result_dict.get("output", "").replace("\\n", "\n")
+        error_msg = result_dict.get("error", "").replace("\\n", "\n")
+
+        # 1. Lógica de Erro (Stderr)
+        if error_msg:
+            self.error_output.setText(error_msg)
+            self.stdout_output.setText("Execução falhou. Verifique a caixa de erro.")
+        else:
+            self.error_output.setText(
+                "Nenhum erro de compilação ou execução reportado."
             )
-        except json.JSONDecodeError:
-            self.display_result(
-                f"ERRO: O servidor retornou uma string JSON inválida.\nResposta:\n{json_response}",
-                True,
-            )
-        except Exception as e:
-            self.display_result(f"Erro inesperado: {e}", True)
+
+        # 2. Lógica de Saída Padrão (Stdout)
+        self.stdout_output.setText(output)
+
+    def handle_error(self, error_message: str):
+        """Recebe erros de comunicação da thread e atualiza a GUI."""
+        self.send_button.setEnabled(True)
+        self.reset_output_boxes()
+
+        self.error_output.setText(f"ERRO DE COMUNICAÇÃO:\n{error_message}")
+        self.error_output.setStyleSheet(
+            "background-color: #ffcccc; color: #880000; border: 1px solid #ff0000;"
+        )
+        self.stdout_output.setText(
+            "Não foi possível conectar ao servidor C. Verifique o status da porta 8400."
+        )
 
 
-# --- Inicialização da Aplicação ---
 if __name__ == "__main__":
-    # Certifique-se de que o arquivo Go inicial exista para evitar erro ao carregar
+    # Garante que o arquivo de código inicial exista
     if not os.path.exists(INITIAL_CODE_FILE):
-        print(f"ATENÇÃO: Criando o arquivo inicial '{INITIAL_CODE_FILE}'.")
         with open(INITIAL_CODE_FILE, "w") as f:
             f.write(
-                'package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println("Hello do GUI!")\n}'
+                'package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println("Initial setup!")\n}'
             )
 
-    root = tk.Tk()
-    app = RemoteExecutorApp(root)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    window = ExecutorGUI()
+    window.show()
+    sys.exit(app.exec())
