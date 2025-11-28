@@ -8,12 +8,15 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <libgen.h>
-#include <sys/wait.h>     // Para pclose()
-#include <fcntl.h>        // Para mkstemp, se necessário (depende do sistema)
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <errno.h>        // Para capturar o código de erro do sistema (errno)
 
 #define BUFFER_SIZE 4096
 #define MAX_OUTPUT_SIZE 4000
-#define TEMP_FILE_TEMPLATE "./go_exec_XXXXXX.go"
+// Template de arquivo temporário na pasta de execução, com placeholder para o TID
+#define TEMP_FILE_TEMPLATE_BASE "./go_exec_TID_%lu_XXXXXX.go"
+#define MAX_TEMP_FILE_PATH 256
 
 
 // --- Funções Auxiliares de String e Erro ---
@@ -23,11 +26,7 @@ void error(const char *msg) {
     exit(1);
 }
 
-/**
- * @brief Encontra e retorna o conteúdo do campo "code" da string JSON.
- * @param json_str A string JSON recebida.
- * @return Um ponteiro para a string de código Go alocada dinamicamente e desescapada.
- */
+// Implementação de extract_code_content (retirada do JSON e desescape)
 char* extract_code_content(const char* json_str) {
     const char* start_key = strstr(json_str, "\"code\":\"");
     if (!start_key) return NULL;
@@ -44,7 +43,6 @@ char* extract_code_content(const char* json_str) {
     strncpy(code, start_key, len);
     code[len] = '\0';
 
-    // Desescapa manualmente as novas linhas (\\n -> \n) e aspas (\")
     char* src = code;
     char* dst = code;
     while (*src) {
@@ -55,7 +53,7 @@ char* extract_code_content(const char* json_str) {
             *dst++ = '"';
             src += 2;
         } else if (*src == '"') {
-             src++; // Ignora aspas soltas
+             src++;
         } else {
             *dst++ = *src++;
         }
@@ -64,11 +62,7 @@ char* extract_code_content(const char* json_str) {
     return code;
 }
 
-/**
- * @brief Escapa a saída para ser inserida em uma string JSON.
- * @param raw_output A saída bruta do comando (stdout/stderr).
- * @return Saída alocada dinamicamente e escapada.
- */
+// Implementação de escape_json_output
 char* escape_json_output(const char* raw_output) {
     size_t raw_len = strlen(raw_output);
     size_t escaped_len = raw_len * 2 + 1;
@@ -94,9 +88,7 @@ char* escape_json_output(const char* raw_output) {
     return escaped;
 }
 
-/**
- * @brief Envia a resposta JSON de volta ao cliente.
- */
+// Implementação de send_response
 void send_response(int newsockfd, const char* output, const char* error_msg) {
     char response_buffer[BUFFER_SIZE * 2];
     char *escaped_output = NULL;
@@ -105,7 +97,6 @@ void send_response(int newsockfd, const char* output, const char* error_msg) {
     if (output) escaped_output = escape_json_output(output);
     if (error_msg) escaped_error = escape_json_output(error_msg);
 
-    // Formato JSON: {"output": "...", "error": "..."}\n
     snprintf(response_buffer, sizeof(response_buffer),
              "{\"output\": \"%s\", \"error\": \"%s\"}\n",
              escaped_output ? escaped_output : "",
@@ -125,16 +116,21 @@ void *handle_client(void *socket_desc) {
     char buffer[BUFFER_SIZE];
     int n;
 
-    // O nome do arquivo temporário precisa ser um array mutável
-    char temp_file_name[] = TEMP_FILE_TEMPLATE;
+    char temp_file_name[MAX_TEMP_FILE_PATH];
     char command[512];
     char output_buffer[MAX_OUTPUT_SIZE];
     char* code_content = NULL;
     FILE *pipe = NULL;
 
-    free(socket_desc); // Libera o ponteiro alocado pelo main
+    free(socket_desc);
 
-    // 1. Comunicação (Read)
+    // 1. --- Formatar o Nome do Arquivo Temporário com o TID ---
+    unsigned long tid = (unsigned long)pthread_self();
+
+    // snprintf formata o template. Ele garante que os 6 X's estejam no final da string.
+    snprintf(temp_file_name, MAX_TEMP_FILE_PATH, TEMP_FILE_TEMPLATE_BASE, tid);
+
+    // 2. Comunicação (Read)
     bzero(buffer, BUFFER_SIZE);
     n = read(newsockfd, buffer, BUFFER_SIZE - 1);
 
@@ -144,7 +140,7 @@ void *handle_client(void *socket_desc) {
     }
     buffer[n] = '\0';
 
-    // 2. Extrair o Código
+    // 3. Extrair o Código
     code_content = extract_code_content(buffer);
 
     if (!code_content) {
@@ -152,24 +148,30 @@ void *handle_client(void *socket_desc) {
         goto cleanup;
     }
 
-    // 3. Salvar o Código em Arquivo Temporário
+    // 4. Salvar o Código em Arquivo Temporário
     int fd = mkstemp(temp_file_name);
+
     if (fd == -1) {
-        send_response(newsockfd, "", "Erro do servidor: Não foi possível criar o arquivo temporário.");
+        // 🚨 VERIFICAÇÃO DE ERRO DETALHADA PARA DEBUG
+        char error_msg[256];
+        snprintf(error_msg, sizeof(error_msg),
+                 "Erro ao criar arquivo temp. Permissão negada ou Template inválido. Template usado: %s (Erro: %s)",
+                 temp_file_name, strerror(errno));
+        send_response(newsockfd, "", error_msg);
         goto cleanup;
     }
-    close(fd); // Fechamos o descritor retornado, vamos usar fopen/remove
+    close(fd); // Fechamos o descritor retornado
 
     FILE *temp_file = fopen(temp_file_name, "w");
     if (!temp_file) {
+        // Este erro é raro se mkstemp funcionou
         send_response(newsockfd, "", "Erro do servidor: Falha ao abrir o arquivo para escrita.");
         goto cleanup;
     }
     fprintf(temp_file, "%s", code_content);
     fclose(temp_file);
 
-    // 4. Executar o Código usando popen
-    // go run [arquivo] 2>&1 (Redireciona stderr para stdout)
+    // 5. Executar o Código usando popen
     snprintf(command, sizeof(command), "go run %s 2>&1", temp_file_name);
 
     pipe = popen(command, "r");
@@ -178,12 +180,11 @@ void *handle_client(void *socket_desc) {
         goto cleanup;
     }
 
-    // 5. Ler a Saída e o Erro
+    // 6. Ler a Saída e o Erro
     output_buffer[0] = '\0';
     char line_buffer[256];
 
     while (fgets(line_buffer, sizeof(line_buffer), pipe) != NULL) {
-        // Concatena a saída, verificando o limite do buffer
         if (strlen(output_buffer) + strlen(line_buffer) < MAX_OUTPUT_SIZE) {
              strcat(output_buffer, line_buffer);
         } else {
@@ -192,19 +193,17 @@ void *handle_client(void *socket_desc) {
         }
     }
 
-    int result_code = pclose(pipe); // Captura o código de retorno
+    int result_code = pclose(pipe);
 
-    // 6. Enviar a Resposta
+    // 7. Enviar a Resposta
     if (result_code != 0) {
-        // Erro de compilação ou execução
         send_response(newsockfd, "", output_buffer);
     } else {
-        // Sucesso na execução
         send_response(newsockfd, output_buffer, "");
     }
 
 cleanup:
-    // 7. Limpeza Final
+    // 8. Limpeza Final
     if (code_content) free(code_content);
     remove(temp_file_name); // Deleta o arquivo temporário
     close(newsockfd);
@@ -225,7 +224,7 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    // 1. Inicialização do Socket e Reuso de Endereço
+    // 1. Inicialização do Socket
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) error("ERROR opening socket");
 
@@ -245,10 +244,9 @@ int main(int argc, char *argv[])
 
     printf("Servidor C Executor em espera na porta %d (Threads)...\n", portno);
 
-
     clilen = sizeof(cli_addr);
     while (1) {
-        // 2. Accept: Aceita a conexão (Bloqueia o main thread)
+        // 2. Accept: Aceita a conexão
         newsockfd = accept(sockfd, (struct sockaddr *) &cli_addr, &clilen);
         if (newsockfd < 0) {
             perror("ERROR on accept");
@@ -272,7 +270,6 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        // 4. Desanexar (Essencial para não ter que esperar explicitamente a thread)
         pthread_detach(client_thread);
     }
 

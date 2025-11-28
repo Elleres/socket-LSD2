@@ -37,7 +37,7 @@ void error(const char *msg)
      // A thread pode liberar o espaço de memória alocado para o socket_desc
      free(socket_desc);
 
-     // 🚨 NOVO: Loop infinito para processar múltiplas requisições
+     //  NOVO: Loop infinito para processar múltiplas requisições
      while (1) {
          // 1. Comunicação (Read)
          bzero(buffer, 256);
