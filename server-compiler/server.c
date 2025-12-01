@@ -152,7 +152,7 @@ void *handle_client(void *socket_desc) {
     int fd = mkstemp(temp_file_name);
 
     if (fd == -1) {
-        // 🚨 VERIFICAÇÃO DE ERRO DETALHADA PARA DEBUG
+        // VERIFICAÇÃO DE ERRO DETALHADA PARA DEBUG
         char error_msg[256];
         snprintf(error_msg, sizeof(error_msg),
                  "Erro ao criar arquivo temp. Permissão negada ou Template inválido. Template usado: %s (Erro: %s)",

@@ -7,7 +7,7 @@
 #include <netinet/in.h>
 #include <netdb.h>
 
-#define HOST "127.0.0.1"
+#define HOST "localhost"
 #define PORT 8300
 #define BUFFER_SIZE 4096
 #define MAX_CODE_SIZE 2048

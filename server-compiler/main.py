@@ -1,6 +1,7 @@
 import json
 import os
 import socket
+import subprocess  # Novo módulo para executar o client.c
 import sys
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
@@ -18,13 +19,15 @@ from PyQt5.QtWidgets import (
 )
 
 # --- Configurações de Comunicação ---
-HOST = "127.0.0.1"
-PORT = 8300  # Porta do Servidor C Executor
+# HOST e PORT não são mais usados pelo TcpWorker (agora são internos ao client.c)
+HOST = "localhost"  # Mantido apenas para contexto da GUI
+PORT = 8300  # Mantido apenas para contexto da GUI
 INITIAL_CODE_FILE = "main.go"
+CLIENT_EXECUTABLE = "./client"  # Nome do executável C
 
 # ----------------------------------------------------------------------
 # --- Thread de Comunicação TCP (Worker) ---
-# A lógica TCP é mantida, garantindo que a GUI não congele.
+# A lógica TCP foi substituída pela execução do client.c
 # ----------------------------------------------------------------------
 
 
@@ -37,75 +40,118 @@ class TcpWorker(QThread):
         self.code_content = code_content
 
     def run(self):
-        """Executa a lógica de comunicação TCP (simulando o client.c)."""
+        """Executa o cliente C para se comunicar com o servidor C."""
+
+        # 1. Salvar o código no arquivo main.go
+        try:
+            with open(INITIAL_CODE_FILE, "w") as f:
+                f.write(self.code_content)
+        except Exception as e:
+            self.error_signal.emit(
+                f"ERRO: Não foi possível escrever em {INITIAL_CODE_FILE}: {str(e)}"
+            )
+            return
+
+        # 2. Verificar se o cliente C existe
+        if not os.path.exists(CLIENT_EXECUTABLE):
+            self.error_signal.emit(
+                f"ERRO: O executável do cliente C não foi encontrado em {CLIENT_EXECUTABLE}. Compile o client.c primeiro."
+            )
+            return
 
         response_data = {}
 
         try:
-            # 1. Escapar e montar a payload JSON
-            # Garante que backslashes, novas linhas e aspas sejam escapados.
-            escaped_code = (
-                self.code_content.replace("\\", "\\\\")
-                .replace("\n", "\\n")
-                .replace('"', '\\"')
+            # 3. Executar o cliente C
+            # A saída padrão do cliente C será capturada (stdout).
+            # O cliente C é responsável por conectar, enviar o código e receber a resposta JSON.
+
+            # Executamos o cliente e esperamos ele terminar.
+            result = subprocess.run(
+                [CLIENT_EXECUTABLE],
+                capture_output=True,  # Captura stdout e stderr
+                text=True,  # Decodifica a saída como texto
+                timeout=15,  # Define um tempo limite para a execução do cliente C
             )
 
-            tcp_payload = f'{{"code":"{escaped_code}"}}\n'
+            # A saída do cliente C (stdout) contém mensagens de log E a resposta JSON.
+            # A resposta JSON é a última coisa que o cliente C imprime.
 
-            # 2. Criar e Conectar o Socket
-            with socket.create_connection((HOST, PORT), timeout=10) as conn:
-                conn.sendall(tcp_payload.encode("utf-8"))
+            # O JSON de resposta deve estar na saída final do cliente C.
+            # O cliente C imprime a resposta JSON entre as linhas de separação:
+            # ============== RESULTADO DO SERVIDOR ==============
+            # {"output": "...", "error": "..."}\n
+            # =================================================
 
-                # 3. Receber a Resposta
-                response_bytes = conn.recv(4096)
+            # Vamos procurar a resposta JSON no stdout
+            stdout_lines = result.stdout.strip().split("\n")
 
-                if not response_bytes:
-                    self.error_signal.emit(
-                        "Servidor C fechou a conexão ou não enviou resposta."
-                    )
-                    return
+            response_json = ""
+            start_capture = False
+            for line in stdout_lines:
+                if "============== RESULTADO DO SERVIDOR ==============" in line:
+                    start_capture = True
+                    continue
+                if "=================================================" in line:
+                    break
+                if start_capture and line.strip():
+                    response_json = line.strip()
+                    break  # O JSON é a próxima linha após o separador
 
-                response_json = response_bytes.decode("utf-8").strip()
+            if not response_json:
+                # Se não encontrou o JSON, considera a saída completa como erro de comunicação
+                error_details = result.stdout + "\n" + result.stderr
+                self.error_signal.emit(
+                    f"ERRO: Não foi possível obter o JSON de resposta do cliente C.\nDetalhes da Execução do Cliente C:\n{error_details}"
+                )
+                return
 
-                # 4. Decodificar a resposta do C Server
-                response_data = json.loads(response_json)
+            # 4. Decodificar a resposta do C Server
+            response_data = json.loads(response_json)
 
-        except socket.timeout:
+        except subprocess.TimeoutExpired:
             self.error_signal.emit(
-                "ERRO: Tempo limite (timeout) atingido ao conectar ou ler do servidor."
+                "ERRO: Tempo limite (timeout) atingido ao executar o cliente C."
             )
             return
-        except ConnectionRefusedError:
+        except FileNotFoundError:
             self.error_signal.emit(
-                f"ERRO: Conexão recusada em {HOST}:{PORT}. O Servidor C está rodando?"
+                f"ERRO: O executável do cliente C não foi encontrado em {CLIENT_EXECUTABLE}."
             )
             return
         except json.JSONDecodeError:
             self.error_signal.emit(
-                f"ERRO: Resposta inválida (JSON corrompido) recebida: {response_json}"
+                f"ERRO: Resposta inválida (JSON corrompido) recebida do cliente C: {response_json}"
             )
             return
         except Exception as e:
-            self.error_signal.emit(f"ERRO inesperado na comunicação TCP: {str(e)}")
+            self.error_signal.emit(
+                f"ERRO inesperado na execução do cliente C: {str(e)}"
+            )
             return
 
         self.result_signal.emit(response_data)
 
 
 # ----------------------------------------------------------------------
-# --- Aplicação Principal PyQt6 ---
+# O restante do código da classe ExecutorGUI e o bloco __main__ permanecem inalterados.
+# A única exceção é o bloco __main__ que deve garantir que o cliente C seja compilado.
 # ----------------------------------------------------------------------
 
 
 class ExecutorGUI(QMainWindow):
+    # ... (o método __init__ e load_initial_code permanecem os mesmos)
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Executor de Código Go Remoto (PyQt6)")
+        self.setWindowTitle("Executor de Código Go Remoto (PyQt6 - Cliente C)")
         self.setGeometry(100, 100, 1000, 800)
 
         self.worker = None
         self.load_initial_code()
         self.init_ui()
+
+    # ... (o método init_ui e reset_output_boxes permanecem os mesmos)
 
     def load_initial_code(self):
         """Carrega o código Go inicial, criando o arquivo se não existir."""
@@ -120,7 +166,7 @@ class ExecutorGUI(QMainWindow):
         main_layout = QVBoxLayout(central_widget)
 
         # 1. --- Área de Edição e Botão (Agrupado) ---
-        editor_group = QGroupBox("Código Fonte Go")
+        editor_group = QGroupBox("Código Fonte Go (Lido por C)")
         editor_layout = QVBoxLayout(editor_group)
 
         self.code_editor = QTextEdit()
@@ -134,7 +180,7 @@ class ExecutorGUI(QMainWindow):
 
         editor_layout.addWidget(self.code_editor)
 
-        self.send_button = QPushButton("Enviar e Executar")
+        self.send_button = QPushButton("Enviar e Executar (via Cliente C)")
         self.send_button.setFont(QFont("Arial", 12, QFont.Weight.Bold))
         self.send_button.setStyleSheet(
             "background-color: #007bff; color: white; padding: 10px; border-radius: 5px;"
@@ -164,7 +210,7 @@ class ExecutorGUI(QMainWindow):
         output_layout.addWidget(stdout_box, 1)  # Fator de alongamento 1
 
         # 2.2. Caixa de Erro (Stderr)
-        error_box = QGroupBox("Erro de Compilação/Execução (Stderr)")
+        error_box = QGroupBox("Erro de Compilação/Execução (Stderr/Comunicação)")
         error_layout = QVBoxLayout(error_box)
 
         self.error_output = QTextEdit()
@@ -197,7 +243,9 @@ class ExecutorGUI(QMainWindow):
         """Inicia a thread worker para executar o código."""
         self.send_button.setEnabled(False)
         self.reset_output_boxes()
-        self.error_output.setText("Conectando e enviando código... Por favor, aguarde.")
+        self.error_output.setText(
+            "Executando cliente C para enviar o código... Por favor, aguarde."
+        )
         self.error_output.setStyleSheet(
             "background-color: #ffffcc; color: black; border: 1px solid #cccc00;"
         )
@@ -215,8 +263,10 @@ class ExecutorGUI(QMainWindow):
         self.reset_output_boxes()
 
         # Desescapa os caracteres de nova linha e aspas
-        output = result_dict.get("output", "").replace("\\n", "\n")
-        error_msg = result_dict.get("error", "").replace("\\n", "\n")
+        output = result_dict.get("output", "").replace("\\n", "\n").replace('\\"', '"')
+        error_msg = (
+            result_dict.get("error", "").replace("\\n", "\n").replace('\\"', '"')
+        )
 
         # 1. Lógica de Erro (Stderr)
         if error_msg:
@@ -235,12 +285,12 @@ class ExecutorGUI(QMainWindow):
         self.send_button.setEnabled(True)
         self.reset_output_boxes()
 
-        self.error_output.setText(f"ERRO DE COMUNICAÇÃO:\n{error_message}")
+        self.error_output.setText(f"ERRO DE EXECUÇÃO/COMUNICAÇÃO:\n{error_message}")
         self.error_output.setStyleSheet(
             "background-color: #ffcccc; color: #880000; border: 1px solid #ff0000;"
         )
         self.stdout_output.setText(
-            "Não foi possível conectar ao servidor C. Verifique o status da porta 8400."
+            "A execução do cliente C falhou. Verifique a caixa de erro para detalhes."
         )
 
 
@@ -251,6 +301,41 @@ if __name__ == "__main__":
             f.write(
                 'package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println("Initial setup!")\n}'
             )
+
+    # Passo de compilação (necessário)
+    try:
+        # Tenta compilar o cliente C antes de iniciar a GUI
+        print(f"Compilando {CLIENT_EXECUTABLE}...")
+        compile_result = subprocess.run(
+            [
+                "gcc",
+                "client.c",
+                "-o",
+                CLIENT_EXECUTABLE,
+                "-lncurses",
+                "-lm",
+                "-lpthread",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if compile_result.returncode != 0:
+            print("====================================")
+            print("ERRO DE COMPILAÇÃO DO CLIENTE C:")
+            print(compile_result.stderr)
+            print("====================================")
+            # Saímos se a compilação falhar, pois o cliente C é essencial
+            sys.exit(1)
+        else:
+            print(
+                f"Compilação de client.c bem-sucedida. Executável: {CLIENT_EXECUTABLE}"
+            )
+
+    except FileNotFoundError:
+        print(
+            "ERRO: O comando 'gcc' não foi encontrado. Certifique-se de que o compilador C está instalado."
+        )
+        sys.exit(1)
 
     app = QApplication(sys.argv)
     window = ExecutorGUI()
